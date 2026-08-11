@@ -176,6 +176,28 @@ CREATE TABLE domains (
     treated            INTEGER NOT NULL DEFAULT 0,  -- forward-compat: controlled site
     notes              TEXT
 );
+
+-- The per-query candidate risk set (see 9.2). Frozen after burn-in; the
+-- analysis dataset is the cross product of activated calls with the rows
+-- of this table for the call's query_id.
+CREATE TABLE query_domains (
+    query_id           TEXT NOT NULL,
+    registrable_domain TEXT NOT NULL REFERENCES domains(registrable_domain),
+    k_threshold        INTEGER NOT NULL,   -- min burn-in citation count for membership
+    added_in_sweep     TEXT NOT NULL REFERENCES sweeps(sweep_id),
+    frozen_at          TEXT NOT NULL,
+    PRIMARY KEY (query_id, registrable_domain, k_threshold)
+);
+
+-- Domains first cited after the freeze. Never silently enter the model;
+-- reported as the novel-domain arrival diagnostic (9.2.1) and consumed
+-- directly by Extension B.
+CREATE TABLE post_freeze_domains (
+    query_id           TEXT NOT NULL,
+    registrable_domain TEXT NOT NULL,
+    first_seen_sweep   TEXT NOT NULL REFERENCES sweeps(sweep_id),
+    PRIMARY KEY (query_id, registrable_domain)
+);
 ```
 
 Three properties this schema enforces:
@@ -192,7 +214,9 @@ The `UNIQUE` constraint on `calls` is what makes sweeps idempotent: re-running a
 
 ```yaml
 panel_id: noise-floor-v1
-budget_cap_usd: 250.00
+budget_cap_usd: 250.00        # cumulative across the whole panel, not per sweep
+burn_in_days: 3               # sweeps used only to construct the risk set (9.2.1)
+risk_set_k: [1, 2, 5]         # membership thresholds; all reported side by side
 
 engines:
   - id: perplexity
@@ -255,28 +279,68 @@ Because the panel is observational and we do not see the retrieval set `R`, the 
 
 ### 9.2 Variance components
 
-Fit a null (no-treatment) mixed-effects logistic model on the binary outcome "domain *d* cited in call *c*":
+#### 9.2.1 The candidate risk set
+
+The outcome is binary — "domain *d* cited in call *c*" — so the analysis dataset is not the `citations` table. It is the cross product of calls with a set of **candidate domains at risk of citation**, including the zero rows for candidates that were not cited. That candidate set must be defined explicitly, because the `citations` table contains only the ones, and any set derived from observed citations is endogenous: a domain enters the universe *because* it was cited, which biases Pr(C = 1) upward and truncates the estimated domain-level variance at the low end.
+
+**Rule.** The risk set is per-query, frozen after a burn-in window:
+
+1. Designate the first `burn_in_days` of sweeps (a `panel.yaml` field) as burn-in.
+2. For query *q*, the risk set at threshold *K* is every registrable domain cited in at least *K* burn-in calls for *q*, across all engines, paraphrases, and windows.
+3. Write the resulting membership to `query_domains` with `frozen_at` set, and hash it into the analysis manifest. It does not change thereafter.
+4. Domains first cited for *q* after the freeze are recorded in `post_freeze_domains` and **excluded from the model**, so the denominator cannot grow with sample size.
+
+Burn-in sweeps are used only to construct the risk set and are excluded from the variance and MDE estimates, so membership and outcome are never estimated from the same data.
+
+**Sensitivity is a deliverable, not a footnote.** The whole point of the prototype is to characterize measurement behavior, so the analysis is run at *K* ∈ {1, 2, 5} and all three variance decompositions are reported side by side. If the noise floor is stable across *K*, the choice is immaterial and can be fixed later; if it is not, that instability is itself a primary finding and must be reported as one.
+
+**Novel-domain arrival is a reported diagnostic.** The rate at which `post_freeze_domains` accumulates is plotted per query over the panel. Excluding these domains from the model does not discard them: this arrival curve is the input Extension B needs, so the freeze and the drift study are complementary rather than in tension.
+
+#### 9.2.2 Model
+
+Fit on **activated calls only** (`activated = 1`). Activation is modeled separately as a call-level binary outcome, consistent with §9.1's refusal to collapse activation into citation. Mixing them would load activation-rate differences into the engine and query random effects and misattribute the noise floor.
 
 ```
-logit Pr(C = 1) = β₀ + b_query + b_paraphrase + b_engine + b_date + b_window + b_domain
+logit Pr(C_{cdi} = 1) = β₀
+                      + b_query + b_paraphrase + b_engine
+                      + b_date + b_window + b_domain
+                      + b_call
 ```
 
-Report the variance attributable to each grouping factor, plus residual run-to-run variance. This is the noise floor, expressed per factor, and it tells you directly which factor to spend budget on.
+`b_call` is an explicit call-level random intercept capturing run-to-run stochasticity. It is named rather than left as "residual" because in a Bernoulli GLMM the residual variance is fixed at π²/3 by the link function and cannot absorb it — without `b_call`, run-to-run variance is silently misallocated to the date and window terms.
+
+Report, at each *K*:
+
+- The variance attributable to each grouping factor
+- The **base citation rate** over the risk set, since every effect size in §9.4 is expressed relative to it
+- The risk-set size per query
+
+This is the noise floor expressed per factor, and it says directly which factor is worth spending budget on.
 
 ### 9.3 Stability
 
-Per (query, engine) pair, compute source-set Jaccard between consecutive days and between windows within a day. Compare against the published consumer-surface benchmark of 0.34–0.42 (Schulte et al.). Any divergence is itself a finding, since prior work measured consumer surfaces and this measures API surfaces.
+"Source set" is ambiguous across 3 paraphrases × 8 repetitions × 3 windows, and the aggregation choice changes the number substantially — a union over many calls trends toward 1.0 and overstates stability. Two distinct quantities are therefore reported, never conflated:
+
+**Run-to-run Jaccard (the noise floor).** The unit is the set of registrable domains cited in a *single call*. Compute mean pairwise Jaccard over the 8 repetitions within a fixed (query, paraphrase, engine, window). This is the quantity the MDE depends on.
+
+**Day-union Jaccard (benchmark-comparable).** The unit is the union of registrable domains cited across all calls for a (query, engine) on a given day. Compute between consecutive days. This matches the construction used by Schulte et al. and is the only one comparable to their published 0.34–0.42.
+
+Both are also computed between windows within a day, which separates time-of-day effects from day-scale drift.
+
+The comparison against the consumer-surface benchmark is reported with the §3.3 limitation attached: prior work measured consumer surfaces, this measures API surfaces, and a divergence may reflect the surface difference rather than a difference in underlying stability. Quantifying which is Extension B, not a claim this prototype can make.
 
 ### 9.4 Minimum detectable effect
 
 Simulation-based, not closed-form. Closed-form power for a binary outcome under crossed random effects is unreliable. Procedure:
 
-1. Fit the null model to collected data
+1. Fit the null model (§9.2.2) to collected data
 2. Parametric bootstrap: simulate datasets with an injected treatment effect of size δ, at a given panel size
 3. Refit and test; repeat to estimate power at δ
 4. Sweep δ and panel size to produce an MDE surface
 
-Output: "to detect a δ percentage-point citation lift at 80% power you need N queries × K reps × D days, costing $X."
+δ is expressed in percentage points **relative to the base citation rate over the risk set** reported in §9.2.2, and is therefore only interpretable alongside it. The MDE surface is produced at each *K* ∈ {1, 2, 5}; if the surfaces diverge materially, the risk-set definition is reported as a limiting factor on the go/no-go rather than silently resolved by picking one.
+
+Output: "to detect a δ percentage-point citation lift, against a base rate of *p*, at 80% power, you need N queries × K reps × D days, costing $X."
 
 ## 10. Error handling
 
@@ -297,6 +361,7 @@ For a measurement instrument, error handling *is* part of the measurement.
 - **Fixture-based adapter tests.** Real captured API responses replayed offline. No live API calls in the test suite, so the suite is free and deterministic.
 - **URL canonicalization table tests.** Table-driven cases covering AMP variants, tracking parameters, redirect chains, trailing slashes, `www`, IDN, and aggregator wrappers. This is where silent data corruption lives, and a canonicalization bug would invalidate every downstream number.
 - **Denominator tests.** Synthetic sweeps with known activation and citation rates; assert the decomposition returns the exact known values, including when null outcomes are present.
+- **Risk-set expansion tests.** On a synthetic panel with a known domain universe: assert the (call × candidate-domain) expansion produces the correct row count; assert zero rows exist for eligible-but-uncited domains; assert `activated = 0` calls are excluded from the §9.2.2 model but retained for the activation model; assert post-freeze domains land in `post_freeze_domains` and never in the analysis dataset; assert the *K* ∈ {1, 2, 5} sets are properly nested.
 - **Power-calculation tests.** Simulated data with an injected known effect; assert the MDE procedure recovers it within tolerance.
 - **Idempotency test.** Run a sweep, kill it mid-way, resume; assert no duplicate calls and no lost rows.
 - **Budget-cap test.** Assert the collector aborts at the cap and marks the sweep correctly.
@@ -306,8 +371,8 @@ For a measurement instrument, error handling *is* part of the measurement.
 
 The prototype is done when the following four outputs exist and are reproducible from retained raw data:
 
-1. **Variance decomposition** — citation variability attributed to run, paraphrase, window, day, engine, and domain
-2. **Stability estimate** — source-set Jaccard for API surfaces, day-over-day and window-over-window, compared against the consumer-surface benchmark
+1. **Variance decomposition** — citation variability attributed to call (run-to-run), paraphrase, window, day, engine, and domain, reported at each *K* ∈ {1, 2, 5}, together with the base citation rate and risk-set size that make the numbers interpretable
+2. **Stability estimate** — run-to-run Jaccard and day-union Jaccard for API surfaces, window-over-window and day-over-day, with the day-union figure compared against the consumer-surface benchmark under the §3.3 limitation
 3. **Cost model** — budget in, panel size and MDE out
 4. **Go/no-go** — a defensible statement of whether an effect of realistic size is detectable at an affordable budget
 
@@ -315,9 +380,9 @@ Note that outputs 1–3 are informative regardless of whether the answer to 4 is
 
 ## 13. Extensions (deliberately deferred)
 
-**Extension A — controlled site.** Once a modifiable indexed domain is available, flag it `treated` in `domains`, apply interventions, and analyze with difference-in-differences against untreated domains. Requires the noise floor from this prototype to size the intervention.
+**Extension A — controlled site.** Once a modifiable indexed domain is available, flag it `treated` in `domains`, apply interventions, and analyze with difference-in-differences. The comparison pool is defined as the untreated members of the same frozen per-query risk set (§9.2.1) — not all observed domains — so treated and control units are drawn from the same universe under the same membership rule. The treated domain must satisfy the risk-set rule at the chosen *K* before intervention, or the parallel-trends assumption has no support. Requires the noise floor from this prototype to size the intervention.
 
-**Extension B — drift as an object of study.** Extend the panel to 30–60 days, pin and log model snapshots, and characterize drift regimes and changepoints (survey §13.5). Publishable as a descriptive study, since all existing stability work measures consumer surfaces rather than API surfaces.
+**Extension B — drift as an object of study.** Extend the panel to 30–60 days, pin and log model snapshots, and characterize drift regimes and changepoints (survey §13.5). The `post_freeze_domains` arrival curve from §9.2.1 is a direct input: novel-domain arrival is one of the drift signals, so the freeze that keeps the §9.2.2 denominator stable also generates this extension's primary data. Publishable as a descriptive study, since all existing stability work measures consumer surfaces rather than API surfaces.
 
 **Extension C — predictive validity probe.** Re-analyze collected data to test whether observable page features predict which domains get cited. Cheap once the panel data exists; falsifies the scorer premise if features do not predict.
 
@@ -330,6 +395,8 @@ Note that outputs 1–3 are informative regardless of whether the answer to 4 is
 | API surfaces prove unrepresentative of consumer surfaces | Stated as a limitation in every output; quantifying the gap becomes Extension B |
 | Budget exhausted before enough days collected | Hard cap plus `estimate.py` projection before any spend; panel size is config, not code |
 | Canonicalization bug silently merges or splits domains | Dedicated table-driven test suite; raw and final URL both retained so the data can be re-normalized |
+| Noise floor turns out to be an artifact of the risk-set definition | Analysis runs at *K* ∈ {1, 2, 5} and reports all three; divergence across *K* is reported as a primary finding rather than resolved by picking one |
+| Burn-in consumes budget without producing analyzable data | Burn-in sweeps are ordinary sweeps and remain in the DB; only their use in estimation is restricted, so they still contribute to stability diagnostics and to the cost model |
 
 ## 15. References
 
